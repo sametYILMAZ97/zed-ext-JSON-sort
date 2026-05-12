@@ -1,0 +1,12 @@
+target/
+node_modules/
+*.wasm
+.DS_Store
+.vscode/
+.idea/
+*.log
+coverage/
+.nyc_output/
+
+# dist/server.bundle.js IS checked in — required for users who install the
+# extension without running `npm run build`. Do NOT ignore dist/.
