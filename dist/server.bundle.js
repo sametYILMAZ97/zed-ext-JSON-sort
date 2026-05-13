@@ -13610,7 +13610,9 @@ var require_jsoncSort = __commonJS({
       let body = "";
       for (let i = 0; i < sortedProps.length; i++) {
         const p = sortedProps[i];
-        body += p.text;
+        let text = p.text;
+        if (text.startsWith("\n")) text = text.slice(1);
+        body += text;
         if (i < sortedProps.length - 1) {
           body += ",";
           if (!p.trailingHasNewline) body += sep.between;
@@ -13814,8 +13816,8 @@ var require_jsoncSort = __commonJS({
       while (closeLineStart > 0 && source2[closeLineStart - 1] !== "\n") closeLineStart--;
       const closeIndent = source2.slice(closeLineStart, closeIdx);
       return {
-        afterOpen: "\n" + indent,
-        between: "\n" + indent,
+        afterOpen: "\n",
+        between: "\n",
         beforeClose: "\n" + closeIndent
       };
     }

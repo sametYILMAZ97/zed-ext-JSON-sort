@@ -138,7 +138,11 @@ function rewriteObject(node, ctx, depth) {
   let body = '';
   for (let i = 0; i < sortedProps.length; i++) {
     const p = sortedProps[i];
-    body += p.text;
+    // sep.afterOpen / sep.between already supply the leading '\n'; strip the
+    // duplicate that was absorbed into the property span to avoid blank lines.
+    let text = p.text;
+    if (text.startsWith('\n')) text = text.slice(1);
+    body += text;
     if (i < sortedProps.length - 1) {
       body += ',';
       if (!p.trailingHasNewline) body += sep.between;
@@ -368,8 +372,8 @@ function guessSeparator(source, openIdx, closeIdx, children) {
   while (closeLineStart > 0 && source[closeLineStart - 1] !== '\n') closeLineStart--;
   const closeIndent = source.slice(closeLineStart, closeIdx);
   return {
-    afterOpen: '\n' + indent,
-    between: '\n' + indent,
+    afterOpen: '\n',
+    between: '\n',
     beforeClose: '\n' + closeIndent,
   };
 }
