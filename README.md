@@ -176,9 +176,9 @@ node --test 'test/**/*.test.js'
 
 ## Known limitations (v0.1)
 
-- JSONC comment ↔ property attribution is heuristic. Block comments that span multiple properties attach to the property they textually precede.
+- JSONC comment ↔ property/element attribution is heuristic. Block comments that span multiple properties or array elements attach to the one they textually precede.
 - JSON5 sort re-emits via `json5` library — fancy formatting (e.g. multi-line strings) is normalized.
-- Arrays inside JSONC are not reordered (only their contents are recursed); structural array sort runs through the JSON serializer.
+- Single-line JSONC objects/arrays that use padding spaces right after `{`/`[` or before `}`/`]` (e.g. `{ "a": 1 }`) may lose that padding once reordered — cosmetic only, output stays valid JSONC.
 
 ## Roadmap (deferred)
 

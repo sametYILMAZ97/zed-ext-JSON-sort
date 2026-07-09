@@ -14,3 +14,7 @@ version = "0.7.0"
 name = "JSON Sort"
 language = "JSON"
 languages = ["JSON", "JSONC"]
+
+[language_servers.json-sort-server.language_ids]
+"JSON" = "json"
+"JSONC" = "jsonc"

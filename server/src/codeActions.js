@@ -1,12 +1,14 @@
 'use strict';
 
 const { CodeActionKind } = require('vscode-languageserver/node');
+const jsoncParser = require('jsonc-parser');
 const {
   detectDialectFromUri,
   stripBOM,
   detectLineEndings,
   detectTrailingNewline,
   detectIndent,
+  parse,
 } = require('./dialect');
 const { sortValue, buildKeyOrderer } = require('./sort');
 const { stringify, applyLineEndings, withBOM, withTrailingNewline } = require('./format');
@@ -31,6 +33,12 @@ function isEmptyRange(range) {
     && range.start.character === range.end.character;
 }
 
+function rangesEqual(a, b) {
+  return !!a && !!b
+    && a.start.line === b.start.line && a.start.character === b.start.character
+    && a.end.line === b.end.line && a.end.character === b.end.character;
+}
+
 function fullDocumentRange(doc) {
   return {
     start: { line: 0, character: 0 },
@@ -42,15 +50,34 @@ function rangeText(doc, range) {
   return doc.getText(range);
 }
 
+// Whether `text` (either the whole document or a selection fragment) is
+// currently well-formed enough to sort/format. Gates the action list itself
+// (rather than only the resolve step) so invalid/mid-edit JSON simply offers
+// no actions instead of showing actions that silently no-op when clicked.
+function isTextSortable(text, dialect, cfg) {
+  if (text.trim().length === 0) return false;
+  if (dialect === 'jsonc') {
+    const errors = [];
+    jsoncParser.parseTree(text, errors, { allowTrailingComma: true, disallowComments: false });
+    return !hasFatalJsoncErrors(errors);
+  }
+  const parseRes = parse(text, dialect, { bigIntSafe: cfg.bigIntSafe });
+  return !(parseRes.errors && parseRes.errors.length > 0);
+}
+
 function buildCodeActions(doc, requestedRange, baseConfig, kindPrefix, commandPrefix, logger, extra) {
   const opts = extra || {};
   const modeFilter = opts.modeFilter || null;
   const forceResolve = !!opts.forceResolve;
 
-  const range = (requestedRange && !isEmptyRange(requestedRange))
-    ? requestedRange
-    : fullDocumentRange(doc);
-  const isSelection = !isEmptyRange(requestedRange || {});
+  const fullDocRange = fullDocumentRange(doc);
+  const hasRequestedRange = requestedRange && !isEmptyRange(requestedRange);
+  // A non-empty range that happens to span the whole document (some clients
+  // send this instead of a zero-width cursor position) is still "no
+  // selection" — otherwise every invocation gets mislabeled "(Selection)"
+  // and loses whole-file handling (BOM/EOL/trailing-newline preservation).
+  const isSelection = hasRequestedRange && !rangesEqual(requestedRange, fullDocRange);
+  const range = hasRequestedRange ? requestedRange : fullDocRange;
 
   const fullText = doc.getText();
   if (baseConfig.maxFileSizeBytes && Buffer.byteLength(fullText, 'utf8') > baseConfig.maxFileSizeBytes) {
@@ -59,6 +86,12 @@ function buildCodeActions(doc, requestedRange, baseConfig, kindPrefix, commandPr
   }
   if (baseConfig.warnFileSizeBytes && Buffer.byteLength(fullText, 'utf8') > baseConfig.warnFileSizeBytes) {
     if (logger) logger.warn('file exceeds warnFileSizeBytes — sort may be slow');
+  }
+
+  const dialect = detectDialectFromUri(doc.uri, doc.languageId);
+  const targetText = isSelection ? rangeText(doc, range) : fullText;
+  if (!isTextSortable(targetText, dialect, baseConfig)) {
+    return [];
   }
 
   const modes = MODES.filter(function f(m) {
@@ -186,7 +219,6 @@ function computeEdit(doc, range, isSelection, cfg, dialect, logger) {
 }
 
 function computeStructuralSort(text, cfg, dialect, effectiveIndent, logger) {
-  const { parse } = require('./dialect');
   const parseRes = parse(text, dialect, { bigIntSafe: cfg.bigIntSafe });
   if (parseRes.errors && parseRes.errors.length > 0) {
     if (logger) logger.debug('parse errors: ' + parseRes.errors.length);

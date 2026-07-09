@@ -1,0 +1,18 @@
+{
+  "zebra": true,
+  "versions": ["item10", "item2", "item1"],
+  "null_val": null,
+  "nested": {
+    "z": 1,
+    "m": {  "y": 1,  "b": 2},
+    "a": 2
+  },
+  "mixed": [3, "b", true, null],
+  "fruits": ["pear", "apple", "banana"],
+  "empty_obj": {},
+  "empty_arr": [],
+  "count": 42,
+  "big": 9007199254740993,
+  "apple": 1,
+  "Banana": "capital B"
+}

@@ -1,17 +1,16 @@
 'use strict';
 
 // Comment- and formatting-preserving JSONC sort.
-// Uses jsonc-parser's AST. Reorders properties by re-arranging their
-// source-text spans (including leading/trailing comments on the same line).
+// Uses jsonc-parser's AST. Reorders properties and (when configured) array
+// elements by re-arranging their source-text spans, including leading/
+// trailing comments on the same line — same convention for both.
 //
 // Limitations:
-//   * Block comments that span multiple properties become attached to the
-//     property they textually precede.
-//   * Number-array / object-array sorting in JSONC re-emits via JSON
-//     (comments inside arrays are lost — rare in practice).
+//   * Block comments that span multiple properties/elements become attached
+//     to the property/element they textually precede.
 
 const jsoncParser = require('jsonc-parser');
-const { buildKeyOrderer } = require('./sort');
+const { buildKeyOrderer, buildComparator } = require('./sort');
 
 function sortJsoncText(text, options, priorityKeys) {
   const errors = [];
@@ -46,11 +45,10 @@ function sortJsoncText(text, options, priorityKeys) {
 function hasFatalError(errors) {
   if (!errors || errors.length === 0) return false;
   // jsonc-parser still returns a tree even with recoverable errors.
-  // Any error beyond comma/trailing-comma is treated as fatal.
+  // Allow CommaExpected (6) since allowTrailingComma is on; anything else
+  // means the tree is unreliable and should not be rewritten.
   for (const e of errors) {
-    if (e.error !== 6 /* CommaExpected */ && e.error !== 0 /* InvalidSymbol harmless */) {
-      // Allow CommaExpected since allowTrailingComma is on.
-    }
+    if (e.error !== 6 /* CommaExpected */) return true;
   }
   return false;
 }
@@ -94,9 +92,7 @@ function rewriteObject(node, ctx, depth) {
 
   // Compute span for each property: includes inline trailing comment +
   // the leading comment(s) sitting on the line(s) just before it.
-  const propsRaw = children.map(function eachChild(propNode, idx) {
-    return computePropertySpan(propNode, idx, children, source, openIdx + 1, closeIdx);
-  });
+  const propsRaw = computePropertySpans(children, source, openIdx + 1, closeIdx);
 
   // Recurse into values, rewriting nested objects/arrays.
   const propsRewritten = children.map(function eachProp(propNode, idx) {
@@ -112,7 +108,8 @@ function rewriteObject(node, ctx, depth) {
     return {
       key: raw.key,
       text: before + newValue + after,
-      leadingNewlineSpan: raw.leadingNewlineSpan,
+      trailingSpacing: raw.trailingSpacing,
+      trailingComment: raw.trailingComment,
       trailingHasNewline: raw.trailingHasNewline,
     };
   });
@@ -138,15 +135,10 @@ function rewriteObject(node, ctx, depth) {
   let body = '';
   for (let i = 0; i < sortedProps.length; i++) {
     const p = sortedProps[i];
-    // sep.afterOpen / sep.between already supply the leading '\n'; strip the
-    // duplicate that was absorbed into the property span to avoid blank lines.
-    let text = p.text;
-    if (text.startsWith('\n')) text = text.slice(1);
-    body += text;
-    if (i < sortedProps.length - 1) {
-      body += ',';
-      if (!p.trailingHasNewline) body += sep.between;
-    }
+    body += stripLeadingSeparator(p.text, sep);
+    const isLast = i === sortedProps.length - 1;
+    body = appendCommaAndComment(body, p, isLast);
+    if (!isLast && !p.trailingHasNewline) body += sep.between;
   }
   // Preserve any trailing whitespace before the closing brace.
   const lastEnd = sortedProps[sortedProps.length - 1];
@@ -168,13 +160,55 @@ function rewriteArray(node, ctx, depth) {
   if (closeIdx === -1) {
     return slice(source, arrStart, node.length);
   }
-
-  // Recurse into element values only; we do NOT reorder array elements in
-  // JSONC mode here (handled by the structural sort path when arrays are
-  // homogeneous primitives — see codeActions.js).
   if (children.length === 0) {
     return slice(source, arrStart, node.length);
   }
+
+  const sortOrder = computeArraySortOrder(children, ctx.options);
+  if (!sortOrder || isIdentityOrder(sortOrder)) {
+    // Not eligible for reordering, or already in sorted order — just
+    // recurse into each element in place, preserving everything else
+    // (whitespace, comments, trailing commas) verbatim.
+    return rewriteArrayElementsInPlace(source, openIdx, closeIdx, children, ctx, depth);
+  }
+
+  // Reordering: compute a span per element (comma + leading comments +
+  // same-line trailing comment) so all of that travels with the element,
+  // the same convention rewriteObject uses for properties.
+  const elemSpans = computeItemSpans(children, source, openIdx + 1, closeIdx);
+  const rewrittenElems = children.map(function eachElem(elNode, idx) {
+    const raw = elemSpans[idx];
+    const valueOffsetInSpan = elNode.offset - raw.start;
+    const before = raw.text.slice(0, valueOffsetInSpan);
+    const after = raw.text.slice(valueOffsetInSpan + elNode.length);
+    const newValue = rewriteNode(elNode, ctx, depth + 1);
+    return {
+      text: before + newValue + after,
+      trailingSpacing: raw.trailingSpacing,
+      trailingComment: raw.trailingComment,
+      trailingHasNewline: raw.trailingHasNewline,
+    };
+  });
+
+  const sep = guessSeparator(source, openIdx, closeIdx, children);
+  const head = slice(source, openIdx, 1);
+  const tail = slice(source, closeIdx, 1);
+
+  let body = '';
+  for (let i = 0; i < sortOrder.length; i++) {
+    const el = rewrittenElems[sortOrder[i]];
+    body += stripLeadingSeparator(el.text, sep);
+    const isLast = i === sortOrder.length - 1;
+    body = appendCommaAndComment(body, el, isLast);
+    if (!isLast && !el.trailingHasNewline) body += sep.between;
+  }
+  const lastEl = rewrittenElems[sortOrder[sortOrder.length - 1]];
+  const trailing = lastEl.trailingHasNewline ? '' : sep.beforeClose;
+
+  return head + sep.afterOpen + body + trailing + tail;
+}
+
+function rewriteArrayElementsInPlace(source, openIdx, closeIdx, children, ctx, depth) {
   let out = '';
   let cursor = openIdx + 1;
   for (let i = 0; i < children.length; i++) {
@@ -185,6 +219,75 @@ function rewriteArray(node, ctx, depth) {
   }
   out += source.slice(cursor, closeIdx);
   return slice(source, openIdx, 1) + out + slice(source, closeIdx, 1);
+}
+
+// Mirrors sort.js's sortArray eligibility rules (same precedence: string
+// arrays, then number arrays, then object arrays by key), but works off
+// jsonc-parser AST node types/values instead of parsed JS values so
+// comments can stay attached to their element during reordering.
+function computeArraySortOrder(children, options) {
+  if (options.sortArrays && children.every(isStringNode)) {
+    const cmp = buildComparator(options);
+    return stableSortIndices(children, function strCmp(a, b) {
+      return cmp(a.value, b.value);
+    });
+  }
+  if (options.sortNumberArrays && children.every(isNumberNode)) {
+    const order = options.sortOrder === 'desc' ? -1 : 1;
+    return stableSortIndices(children, function numCmp(a, b) {
+      return order * (a.value - b.value);
+    });
+  }
+  if (options.sortObjectArraysBy && children.every(isObjectNode)) {
+    const key = options.sortObjectArraysBy;
+    const cmp = buildComparator(options);
+    const order = options.sortOrder === 'desc' ? -1 : 1;
+    return stableSortIndices(children, function objCmp(a, b) {
+      const av = objectPropertyLeaf(a, key);
+      const bv = objectPropertyLeaf(b, key);
+      if (av == null && bv == null) return 0;
+      if (av == null) return 1;
+      if (bv == null) return -1;
+      if (typeof av === 'string' && typeof bv === 'string') return cmp(av, bv);
+      if (typeof av === 'number' && typeof bv === 'number') return order * (av - bv);
+      return cmp(String(av), String(bv));
+    });
+  }
+  return null;
+}
+
+function isStringNode(n) { return n.type === 'string'; }
+function isNumberNode(n) { return n.type === 'number'; }
+function isObjectNode(n) { return n.type === 'object'; }
+
+function objectPropertyLeaf(objNode, key) {
+  const props = objNode.children || [];
+  for (const prop of props) {
+    const keyNode = prop.children && prop.children[0];
+    const valueNode = prop.children && prop.children[1];
+    if (keyNode && keyNode.value === key && valueNode) {
+      return (valueNode.type === 'string' || valueNode.type === 'number')
+        ? valueNode.value
+        : undefined;
+    }
+  }
+  return undefined;
+}
+
+function stableSortIndices(children, nodeCmp) {
+  const indices = children.map(function eachIdx(_, i) { return i; });
+  indices.sort(function stableCmp(a, b) {
+    const r = nodeCmp(children[a], children[b]);
+    return r !== 0 ? r : a - b;
+  });
+  return indices;
+}
+
+function isIdentityOrder(order) {
+  for (let i = 0; i < order.length; i++) {
+    if (order[i] !== i) return false;
+  }
+  return true;
 }
 
 function findMatchingClose(source, openIdx, openCh, closeCh, hardEnd) {
@@ -222,54 +325,121 @@ function findMatchingClose(source, openIdx, openCh, closeCh, hardEnd) {
   return -1;
 }
 
-function computePropertySpan(propNode, idx, allProps, source, bodyStart, bodyEnd) {
-  const keyNode = propNode.children[0];
-  const valueNode = propNode.children[1];
-  const key = keyNode.value;
+// Computes the source-text span each item (object property or array
+// element) occupies once its leading comments/blank lines are absorbed into
+// it. The trailing comma and any same-line trailing comment are tracked
+// SEPARATELY (not folded into `text`) so reassembly stays the single place
+// that ever emits a comma — an item's own span never embeds one, so
+// reordering can't produce a doubled-up comma.
+//
+// Spans are threaded sequentially (each item's search boundary is the
+// PREVIOUS item's actual consumed end — through its trailing comment, if
+// any — not its raw AST node end) so a same-line trailing comment claimed
+// by item N can never also be re-claimed as a leading comment by item N+1.
+function computeItemSpans(items, source, bodyStart, bodyEnd) {
+  const spans = [];
+  let prevEnd = bodyStart;
+  for (let idx = 0; idx < items.length; idx++) {
+    const itemNode = items[idx];
 
-  const prevEnd = idx === 0
-    ? bodyStart
-    : (allProps[idx - 1].offset + allProps[idx - 1].length);
+    // Walk forward from prevEnd skipping same-line whitespace + a comma
+    // until we hit the start of meaningful content for THIS item. Only
+    // same-line whitespace (not newlines) is skipped here — if the
+    // previous item's span already consumed through a trailing comment,
+    // prevEnd sits at that comment's line end and there's no comma left to
+    // find; crossing the newline would eat into this item's own leading
+    // indentation/comments instead of leaving that to absorbLeadingComments.
+    let cursor = prevEnd;
+    if (idx > 0) {
+      while (cursor < itemNode.offset && (source[cursor] === ' ' || source[cursor] === '\t')) cursor++;
+      if (source[cursor] === ',') cursor++;
+    }
 
-  // Walk forward from prevEnd skipping the comma + leading whitespace/comments
-  // until we hit the start of meaningful content for THIS property.
-  let cursor = prevEnd;
-  if (idx > 0) {
-    // Skip a comma if present (with surrounding whitespace).
-    while (cursor < propNode.offset && /\s/.test(source[cursor])) cursor++;
-    if (source[cursor] === ',') cursor++;
+    // Pull in leading comments / blank lines that precede this item.
+    const start = absorbLeadingComments(source, cursor, itemNode.offset);
+
+    // The item's own text: leading comments through the value's own end —
+    // deliberately excludes the trailing comma and trailing comment.
+    const valueEnd = itemNode.offset + itemNode.length;
+    const text = source.slice(start, valueEnd);
+
+    const hardEnd = idx === items.length - 1 ? bodyEnd : items[idx + 1].offset;
+    const trailing = scanTrailingComment(source, valueEnd, hardEnd);
+    const trailingHasNewline = /\n$/.test(source.slice(start, trailing.end));
+
+    spans.push({
+      text: text,
+      start: start,
+      trailingSpacing: trailing.spacing,
+      trailingComment: trailing.comment,
+      trailingHasNewline: trailingHasNewline,
+    });
+    prevEnd = trailing.end;
   }
+  return spans;
+}
 
-  // start = end of previous separator line. Leading comments attached on
-  // previous lines belong to this property if they're separated by only
-  // whitespace from this property's first non-ws char.
-  let start = cursor;
-  // Pull in leading comments / blank lines that precede this property.
-  // Strategy: keep advancing start to just-after the previous newline that
-  // sits between previous property and a leading comment on its own line.
-  start = absorbLeadingComments(source, cursor, propNode.offset);
+// From right after a value, skips an optional comma + whitespace and
+// captures a same-line trailing comment if present (with the exact
+// whitespace that separated it from the comma, for fidelity). Returns the
+// comment text (empty if none) and the absolute offset actually consumed,
+// for threading `prevEnd` forward — the comma itself is never included.
+function scanTrailingComment(source, valueEnd, hardEnd) {
+  let i = valueEnd;
+  while (i < hardEnd && (source[i] === ' ' || source[i] === '\t')) i++;
+  if (source[i] === ',') i++;
+  const wsStart = i;
+  let j = i;
+  while (j < hardEnd && (source[j] === ' ' || source[j] === '\t')) j++;
+  if (source[j] === '/' && (source[j + 1] === '/' || source[j + 1] === '*')) {
+    let k = j;
+    if (source[j + 1] === '/') {
+      while (k < hardEnd && source[k] !== '\n') k++;
+    } else {
+      while (k < hardEnd - 1 && !(source[k] === '*' && source[k + 1] === '/')) k++;
+      k += 2;
+    }
+    return { spacing: source.slice(wsStart, j), comment: source.slice(j, k), end: k };
+  }
+  return { spacing: '', comment: '', end: valueEnd };
+}
 
-  // End at next comma or close (excluded). For inline trailing comments on
-  // the same line, include them in this property's span.
-  let end = propNode.offset + propNode.length;
-  end = absorbTrailingInlineComment(source, end, idx === allProps.length - 1
-    ? bodyEnd
-    : allProps[idx + 1].offset);
+function computePropertySpans(props, source, bodyStart, bodyEnd) {
+  const spans = computeItemSpans(props, source, bodyStart, bodyEnd);
+  return spans.map(function addKey(span, idx) {
+    const keyNode = props[idx].children[0];
+    return {
+      key: keyNode.value,
+      text: span.text,
+      start: span.start,
+      trailingSpacing: span.trailingSpacing,
+      trailingComment: span.trailingComment,
+      trailingHasNewline: span.trailingHasNewline,
+    };
+  });
+}
 
-  const text = source.slice(start, end);
-  const leadingNewlineSpan = text.match(/^[ \t]*\n/)
-    ? text.match(/^[ \t]*\n/)[0]
-    : '';
-  const trailingHasNewline = /\n$/.test(text);
+// Appends exactly one comma (unless this is the last item in the new
+// order) plus any trailing comment, using the item's own recorded spacing.
+function appendCommaAndComment(body, item, isLast) {
+  if (!isLast) body += ',';
+  if (item.trailingComment) body += item.trailingSpacing + item.trailingComment;
+  return body;
+}
 
-  return {
-    key: key,
-    text: text,
-    start: start,
-    end: end,
-    leadingNewlineSpan: leadingNewlineSpan,
-    trailingHasNewline: trailingHasNewline,
-  };
+// An item's own span may carry a leading separator gap absorbed from the
+// original text — a newline (multi-line format) or a plain space (single-
+// line format) that sat between the previous comma and this item. `sep`
+// (afterOpen/between) already supplies an equivalent gap during reassembly,
+// so strip exactly the one that's redundant: in multi-line format only the
+// leading newline itself (indentation/comment lines after it are real
+// content and must stay); in single-line format the whole leading run of
+// spaces/tabs (there's no indentation concept to preserve).
+function stripLeadingSeparator(text, sep) {
+  if (sep.afterOpen === '') {
+    return text.replace(/^[ \t]+/, '');
+  }
+  return text.startsWith('\n') ? text.slice(1) : text;
 }
 
 function absorbLeadingComments(source, cursor, propStart) {
@@ -304,29 +474,6 @@ function absorbLeadingComments(source, cursor, propStart) {
     break;
   }
   return Math.max(cursor, i);
-}
-
-function absorbTrailingInlineComment(source, end, hardEnd) {
-  // If immediately after `end` there's a comma, allow same-line trailing
-  // comment to be absorbed when we reorder. (Comma stays at the boundary.)
-  let i = end;
-  // Skip a possible comma+spaces.
-  while (i < hardEnd && (source[i] === ' ' || source[i] === '\t')) i++;
-  if (source[i] === ',') i++;
-  // Same-line inline comment?
-  let j = i;
-  while (j < hardEnd && (source[j] === ' ' || source[j] === '\t')) j++;
-  if (source[j] === '/' && (source[j + 1] === '/' || source[j + 1] === '*')) {
-    // Scan to end of comment or end-of-line.
-    if (source[j + 1] === '/') {
-      while (j < hardEnd && source[j] !== '\n') j++;
-    } else {
-      while (j < hardEnd - 1 && !(source[j] === '*' && source[j + 1] === '/')) j++;
-      j += 2;
-    }
-    return j;
-  }
-  return end;
 }
 
 function sameKeyOrder(a, b) {
